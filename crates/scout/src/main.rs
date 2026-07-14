@@ -134,7 +134,11 @@ async fn initial_setup(config: &Options) -> Result<(uuid::Uuid, MachineId), eyre
         // we only want to retry if attestation has failed. In all other cases
         // just preserve the old behaviour by breaking from the retry loop
         tracing::error!(error = %error, "Failed to register machine");
-        if !error.to_string().contains("Attestation failed") {
+        if !error
+            .to_string()
+            .to_lowercase()
+            .contains("attestation failed")
+        {
             tracing::info!("Not retrying registration as it is not an attestation error");
             RetryPolicy::Break
         } else {
@@ -163,7 +167,7 @@ async fn initial_setup(config: &Options) -> Result<(uuid::Uuid, MachineId), eyre
         interface_id
     } else {
         return Err(eyre::eyre!(
-            "machine_interface_id is unknown. Can't continue."
+            "machine_interface_id is unknown. can't continue"
         ));
     };
 
