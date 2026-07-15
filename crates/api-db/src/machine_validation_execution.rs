@@ -964,6 +964,144 @@ mod tests {
         Ok(attempt_id)
     }
 
+    fn successful_result(
+        validation_id: MachineValidationId,
+        test_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> MachineValidationResult {
+        MachineValidationResult {
+            validation_id,
+            name: test_id.to_string(),
+            description: "deadlock regression".to_string(),
+            stdout: "ok".to_string(),
+            stderr: String::new(),
+            command: "echo".to_string(),
+            args: "ok".to_string(),
+            context: "OnDemand".to_string(),
+            exit_code: 0,
+            start_time: now,
+            end_time: now + chrono::Duration::seconds(1),
+            test_id: Some(test_id.to_string()),
+        }
+    }
+
+    #[crate::sqlx_test]
+    async fn result_persistence_and_heartbeat_do_not_deadlock(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let now = chrono::Utc::now();
+        let test_id = "deadlock-regression";
+        let mut setup_txn = pool.begin().await?;
+        let validation_id = insert_active_validation(setup_txn.as_mut(), now).await?;
+        insert_attempt(
+            setup_txn.as_mut(),
+            &validation_id,
+            test_id,
+            0,
+            MachineValidationAttemptState::Running,
+            Some(now),
+            Some(now),
+        )
+        .await?;
+        setup_txn.commit().await?;
+
+        let result = successful_result(validation_id, test_id, now);
+        let (result_ready_tx, result_ready_rx) = tokio::sync::oneshot::channel();
+        let (heartbeat_pid_tx, heartbeat_pid_rx) = tokio::sync::oneshot::channel();
+        let (heartbeat_waiting_tx, heartbeat_waiting_rx) = tokio::sync::oneshot::channel();
+
+        let result_pool = pool.clone();
+        let result_task = tokio::spawn(async move {
+            let mut txn = result_pool.begin().await.map_err(|err| err.to_string())?;
+            crate::machine_validation::lock_by_id_no_key_update(
+                txn.as_mut(),
+                &result.validation_id,
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+            record_result(txn.as_mut(), &result)
+                .await
+                .map_err(|err| err.to_string())?;
+            result_ready_tx
+                .send(())
+                .map_err(|_| "could not signal result write".to_string())?;
+            heartbeat_waiting_rx.await.map_err(|err| err.to_string())?;
+            crate::machine_validation_result::create(result, txn.as_mut())
+                .await
+                .map_err(|err| err.to_string())?;
+            txn.commit().await.map_err(|err| err.to_string())
+        });
+
+        let heartbeat_pool = pool.clone();
+        let heartbeat_task = tokio::spawn(async move {
+            result_ready_rx.await.map_err(|err| err.to_string())?;
+            let mut txn = heartbeat_pool
+                .begin()
+                .await
+                .map_err(|err| err.to_string())?;
+            let pid = sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+                .fetch_one(&mut *txn)
+                .await
+                .map_err(|err| err.to_string())?;
+            heartbeat_pid_tx
+                .send(pid)
+                .map_err(|_| "could not signal heartbeat pid".to_string())?;
+            record_heartbeat(
+                txn.as_mut(),
+                &validation_id,
+                None,
+                None,
+                Some(test_id),
+                now + chrono::Duration::seconds(2),
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+            txn.commit().await.map_err(|err| err.to_string())
+        });
+
+        let heartbeat_pid = heartbeat_pid_rx.await?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_locks
+                        WHERE pid=$1
+                            AND NOT granted
+                    )",
+                )
+                .bind(heartbeat_pid)
+                .fetch_one(&pool)
+                .await?;
+                if waiting {
+                    return Ok::<(), sqlx::Error>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| std::io::Error::other("heartbeat did not wait on result transaction"))??;
+
+        heartbeat_waiting_tx
+            .send(())
+            .map_err(|_| std::io::Error::other("could not release result transaction"))?;
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (result_outcome, heartbeat_outcome) = tokio::join!(result_task, heartbeat_task);
+            result_outcome
+                .map_err(|err| std::io::Error::other(err.to_string()))?
+                .map_err(std::io::Error::other)?;
+            heartbeat_outcome
+                .map_err(|err| std::io::Error::other(err.to_string()))?
+                .map_err(std::io::Error::other)?;
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+        .map_err(|_| std::io::Error::other("result and heartbeat deadlocked"))??;
+
+        Ok(())
+    }
+
     #[crate::sqlx_test]
     async fn find_stale_active_attempts_respects_heartbeat_and_duration_fallback(
         pool: sqlx::PgPool,
