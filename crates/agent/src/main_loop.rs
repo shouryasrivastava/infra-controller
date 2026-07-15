@@ -29,6 +29,7 @@ use ::rpc::forge::ManagedHostNetworkConfigResponse;
 use ::rpc::forge_tls_client::ForgeClientConfig;
 use ::rpc::{forge as rpc, forge_tls_client};
 use carbide_host_support::agent_config::AgentConfig;
+use carbide_instrument::{Outcome, emit};
 use carbide_network::virtualization::VpcVirtualizationType;
 use carbide_rpc_utils::dhcp::{DhcpTimestamps, DhcpTimestampsFilePath};
 use carbide_systemd::systemd;
@@ -55,7 +56,9 @@ use crate::ethernet_virtualization::{
 use crate::fmds_client::FmdsUpdater;
 use crate::health::HealthCheckParams;
 use crate::host_machine_id::get_host_machine_id_retry;
-use crate::instrumentation::{create_metrics, get_dpu_agent_meter, get_prometheus_registry};
+use crate::instrumentation::{
+    ReportLoop, ReportLoopCompleted, create_metrics, get_dpu_agent_meter, get_prometheus_registry,
+};
 use crate::machine_inventory_updater::MachineInventoryUpdaterConfig;
 use crate::network_monitor::{self, NetworkPingerType};
 use crate::util::get_host_boot_timestamp;
@@ -183,6 +186,12 @@ pub async fn setup_and_run(
                     error = format!("{e:#}"),
                     "Failed to connect to external FMDS service, falling back to embedded"
                 );
+                // Count the failed external-FMDS bring-up as a push error, so a
+                // configured-but-unreachable FMDS is visible rather than silent.
+                emit(ReportLoopCompleted {
+                    report_loop: ReportLoop::FmdsPush,
+                    outcome: Outcome::Error,
+                });
                 FmdsUpdater::Embedded(instance_metadata_state.clone())
             }
         }
@@ -1423,16 +1432,25 @@ pub async fn record_network_status(
                 error = format!("{err:#}"),
                 "record_network_status: Could not connect to Forge API server. Will retry."
             );
+            emit(ReportLoopCompleted {
+                report_loop: ReportLoop::NetworkStatus,
+                outcome: Outcome::Error,
+            });
             return;
         }
     };
     let request = tonic::Request::new(status);
-    if let Err(err) = client.record_dpu_network_status(request).await {
+    let result = client.record_dpu_network_status(request).await;
+    if let Err(err) = &result {
         tracing::error!(
             error = format!("{err:#}"),
             "Error while executing the record_network_status gRPC call"
         );
     }
+    emit(ReportLoopCompleted {
+        report_loop: ReportLoop::NetworkStatus,
+        outcome: Outcome::from(&result),
+    });
 }
 
 // Get the link type, carrier status, MTU, and whatever else for our uplinks
